@@ -61,21 +61,22 @@ The AI Assistant is where most of the complexity lives. Inspired by Claude's own
          │
          ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  ORCHESTRATOR — ask_claude_for_sql()                         │
+│  ROUTING CALL — ask_claude_for_sql()                         │
 │  One LLM call that returns exactly one of three sentinels:   │
 │                                                              │
-│   (a) "USE_AGENT_MODE"   →  multi-step agent with tools      │
+│   (a) "USE_AGENT_MODE"   →  plan-execute-synthesize pipeline │
 │   (b) "NO_SQL_NEEDED"    →  conversational reply, no DB      │
 │   (c) "SELECT ..."       →  fast path: run + analyze         │
 │                                                              │
-│  Uses Haiku 4.5 / Flash-Lite (cheap + fast) for routing.     │
+│  Anthropic default: Claude Opus 4.7 (quality over cost for   │
+│  task decomposition). Gemini default: 2.5 Flash-Lite.        │
 └──────────────────────────────────────────────────────────────┘
          │
     ┌────┼─────────────────────────────────────────────────┐
     ▼    ▼                                                 ▼
   [a]  [b]                                               [c]
- AGENT  CHAT                                          FAST PATH
-  LOOP  PATH                                              │
+ PES   CHAT                                          FAST PATH
+ PIPE  PATH                                              │
     │    │                                                ▼
     │    │                                       ┌──────────────────┐
     │    │                                       │ run_query()      │
@@ -106,8 +107,26 @@ The AI Assistant is where most of the complexity lives. Inspired by Claude's own
     │            │                                        │
     ▼            │                                        │
 ┌──────────────────────────────────────────────────────┐  │
-│ AGENT LOOP — run_agent_loop()                        │  │
+│ PLAN → EXECUTE → SYNTHESIZE  (run_plan_execute_      │  │
+│                                  synthesize)         │  │
 │                                                      │  │
+│  1. PLAN  (plan_question)                            │  │
+│     Opus 4.7 / Flash-Lite · returns JSON:            │  │
+│       {"subtasks":[{id,title,scope},…]}  max 10      │  │
+│     Empty list → fall through to single agent run.   │  │
+│                                                      │  │
+│  2. EXECUTE  (one run_agent_loop per subtask,        │  │
+│               fresh context per subtask)             │  │
+│     • progress_cb("Building 3/5: Network")           │  │
+│     • artifact_cb(art) → live card in chat           │  │
+│     • subtask failures are tolerated; others still   │  │
+│       build, failures noted in the final summary     │  │
+│                                                      │  │
+│  3. SYNTHESIZE  (synthesize_response)                │  │
+│     Sonnet 4.6 / 2.5 Flash · short friendly summary  │  │
+│     "I built 5 files covering Billing, Support …"    │  │
+│                                                      │  │
+│  INNER AGENT — run_agent_loop()                      │  │
 │  max_steps = 20      max_tokens = 8192               │  │
 │  model     = Sonnet 4.6 / Gemini 3.1 Pro             │  │
 │                                                      │  │
@@ -179,21 +198,22 @@ The AI Assistant is where most of the complexity lives. Inspired by Claude's own
 
 ### Smart routing by task
 
-The orchestrator picks the cheapest-capable model per task (Claude is default — Gemini used only if the user switches the provider):
+The app picks the right model per task. For **Anthropic**, only Sonnet and Opus are used (Haiku is excluded by project policy). For **Gemini**, we use Flash-Lite / Flash / Pro.
 
 | Task | Anthropic | Gemini |
 |---|---|---|
-| Orchestrator (SQL routing) | **Haiku 4.5** | 2.5 Flash-Lite |
+| Routing call + **planner** | **Claude Opus 4.7** | 2.5 Flash-Lite |
 | Conversational (NO_SQL path) | Sonnet 4.6 | 2.5 Flash |
 | Data analysis | Sonnet 4.6 | 2.5 Flash |
-| Agent / multi-step tool use | **Sonnet 4.6** | **3.1 Pro Preview** |
+| Agent (inner loop) | Sonnet 4.6 | **3.1 Pro Preview** |
+| Synthesizer (final summary) | Sonnet 4.6 | 2.5 Flash |
 
-Users can override via the sidebar (`Auto (smart routing)` or specific model name).
+The planner gets Opus because task decomposition quality matters most for multi-artifact requests. Users can override via the sidebar (`Auto (smart routing)` or specific model name).
 
 ### File layout
 ```
 ptcl-test/
-├── app.py                 # Streamlit UI + DB helpers + AI orchestration (~1,280 lines)
+├── app.py                 # Streamlit UI + DB + AI orchestration (plan/execute/synthesize)
 ├── llm_client.py          # Provider-agnostic LLM wrapper (Anthropic + Gemini via LiteLLM)
 ├── skills.py              # Agent tools: query_database, create_excel_artifact, create_word_artifact
 ├── conftest.py            # pytest fixtures (Streamlit mock, DB mock, LiteLLM mock)
@@ -201,7 +221,7 @@ ptcl-test/
 ├── requirements.txt       # Runtime dependencies
 ├── requirements-test.txt  # Dev/test dependencies
 ├── logs/                  # Daily log files (app_YYYY-MM-DD.log)
-├── tests/                 # 220 tests across 10 files
+├── tests/                 # 241 tests across 11 files
 └── README.md              # This file
 ```
 
@@ -244,11 +264,12 @@ Switch providers, models, and tiers from the sidebar. All model IDs verified aga
 
 | Model | API ID | Notes |
 |---|---|---|
-| Claude Opus 4.7 | `claude-opus-4-7` | Current flagship — best for agentic coding |
-| Claude Sonnet 4.6 | `claude-sonnet-4-6` | Best speed/intelligence balance |
-| Claude Haiku 4.5 | `claude-haiku-4-5` | Cheapest + fastest |
-| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929` | Still supported, pinned version |
+| Claude Opus 4.7 | `claude-opus-4-7` | Current flagship — used for planning |
+| Claude Sonnet 4.6 | `claude-sonnet-4-6` | Best speed/intelligence balance — used for everything else |
+| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929` | Legacy, pinned version |
 | Claude Opus 4.6 | `claude-opus-4-6` | Prior generation |
+
+> **Policy:** Claude Haiku is intentionally excluded from this app — only Sonnet and Opus are offered.
 
 **Gemini models** ([docs](https://ai.google.dev/gemini-api/docs/models)):
 
@@ -372,7 +393,7 @@ Conversational path: Sonnet/Flash summarizes the schema in plain English — no 
 
 ## Testing
 
-**220 tests** across 10 files — all runnable with no real DB or API key.
+**241 tests** across 11 files — all runnable with no real DB or API key.
 
 ```bash
 # Run all tests (mocked, ~75 seconds)
@@ -397,9 +418,10 @@ pytest tests/test_stop_reasons.py -v
 | `test_edge_cases.py` | API errors, fence stripping, data edge cases | 17 |
 | `test_security.py` | SQL injection, read-only enforcement | 12 |
 | `test_skills.py` | Tool definitions, dispatchers, artifact builders | 25 |
-| `test_llm_client.py` | Provider abstraction, tier mapping, stop-reason normalization | 47 |
+| `test_llm_client.py` | Provider abstraction, tier mapping, Haiku exclusion, tier cache | 50 |
 | `test_stop_reasons.py` | Reproduces known bugs (max_tokens crash), recovery paths | 15 |
-| **Total** | | **220** |
+| `test_orchestrator.py` | **NEW**: Plan → Execute → Synthesize pipeline, planner, synthesizer, tier cache | 18 |
+| **Total** | | **241** |
 
 ### Integration tests (optional, not run by default)
 ```bash
@@ -426,7 +448,9 @@ Documented here because the tests continue to guard against regression:
 | F | Long responses ended prematurely ("Customer Service & Support: 15 (") | `max_tokens=1024` on `ask_claude_for_sql` silently truncated prose responses | Re-route prose through `ask_claude_no_sql` with 4096 tokens + explicit truncation detection |
 | G | `Unexpected stop reason: max_tokens` agent crash | Loop only handled `end_turn` / `tool_use` | Full stop-reason coverage: auto-continue for text, graceful message for mid-tool-call, preserve already-built artifacts |
 | H | Agent ran out of steps and hid successfully built artifacts behind "I reached my step limit" | Exit message didn't mention partial success | Bumped `AGENT_MAX_STEPS` 10 → 20; exit message now lists all built files and suggests asking for the rest |
-| I | Outdated / deprecated model IDs (`claude-sonnet-4-20250514`, `claude-opus-4-20250514` — retire Jun 15 2026) and wrong tier values (`service_tier=priority` isn't a valid Anthropic **request** value) | Stale catalog, no per-provider tier mapping | Refreshed catalogs against vendor docs (Claude Opus 4.7 / Sonnet 4.6 / Haiku 4.5; Gemini 3.1 Pro Preview, 3 Flash, 3.1 Flash-Lite Preview); added `TIER_API_VALUE` mapping; removed Batch (separate API); graceful-fallback retry if LiteLLM rejects the param |
+| I | Outdated / deprecated model IDs (`claude-sonnet-4-20250514`, `claude-opus-4-20250514` — retire Jun 15 2026) and wrong tier values (`service_tier=priority` isn't a valid Anthropic **request** value) | Stale catalog, no per-provider tier mapping | Refreshed catalogs against vendor docs (Claude Opus 4.7 / Sonnet 4.6; Gemini 3.1 Pro Preview, 3 Flash, 3.1 Flash-Lite Preview); added `TIER_API_VALUE` mapping; removed Batch (separate API); graceful-fallback retry if LiteLLM rejects the param |
+| J | Multi-category questions (*"for each area, give me an Excel…"*) crashed with `max_tokens` mid-tool-call — the agent tried to build ONE giant artifact containing every category | Single agent loop had no way to decompose the task and couldn't fit the JSON arguments in one 8192-token response | New **Plan → Execute → Synthesize** orchestrator: planner (Opus) decomposes into subtasks, executor runs one focused agent per subtask (fresh context, one artifact each), synthesizer produces a final summary. Live progress bar + artifact cards. |
+| K | Noisy `WARNING service_tier='standard_only' not supported` log firing on every LLM call (confirmed in logs across dozens of calls) | Warning printed unconditionally on the fallback retry path | Added a module-level `_TIER_UNSUPPORTED` cache in `llm_client.py`: first rejection is learned and the param is skipped entirely on subsequent calls — one warning total, not one per call |
 
 ---
 
