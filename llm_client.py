@@ -28,21 +28,47 @@ logger = logging.getLogger("db_explorer")
 # ---------------------------------------------------------------------------
 
 ANTHROPIC_MODELS = {
-    "Claude Sonnet 4": "claude-sonnet-4-20250514",
-    "Claude Haiku 3.5": "claude-haiku-4-5",
-    "Claude Opus 4": "claude-opus-4-20250514",
+    # Current generation (April 2026) — verified against
+    # https://platform.claude.com/docs/en/about-claude/models/overview
+    "Claude Opus 4.7":   "claude-opus-4-7",              # current flagship
+    "Claude Sonnet 4.6": "claude-sonnet-4-6",            # current best-value
+    "Claude Haiku 4.5":  "claude-haiku-4-5",             # current cheapest
+    # Legacy (still available, not deprecated)
+    "Claude Sonnet 4.5": "claude-sonnet-4-5-20250929",
+    "Claude Opus 4.6":   "claude-opus-4-6",
 }
 
 GEMINI_MODELS = {
-    "Gemini 2.5 Pro": "gemini/gemini-2.5-pro",
-    "Gemini 2.5 Flash": "gemini/gemini-2.5-flash",
-    "Gemini 2.5 Flash-Lite": "gemini/gemini-2.5-flash-lite",
-    "Gemini 3.1 Pro Preview": "gemini/gemini-3.1-pro-preview",
+    # Gemini 3.x (current) — verified against https://ai.google.dev/gemini-api/docs/models
+    "Gemini 3.1 Pro Preview":        "gemini/gemini-3.1-pro-preview",
+    "Gemini 3 Flash":                "gemini/gemini-3-flash-preview",
+    "Gemini 3.1 Flash-Lite Preview": "gemini/gemini-3.1-flash-lite-preview",
+    # Gemini 2.5 (legacy but still supported)
+    "Gemini 2.5 Pro":                "gemini/gemini-2.5-pro",
+    "Gemini 2.5 Flash":              "gemini/gemini-2.5-flash",
+    "Gemini 2.5 Flash-Lite":         "gemini/gemini-2.5-flash-lite",
 }
 
+# User-facing tier labels per provider. "Batch" is intentionally omitted —
+# it is a separate asynchronous API endpoint, not a per-request service_tier.
 TIERS_BY_PROVIDER = {
     "anthropic": ["standard", "priority"],
-    "gemini": ["standard", "priority", "flex", "batch"],
+    "gemini":    ["standard", "priority", "flex"],
+}
+
+# Internal mapping to the exact value sent over the wire.
+# Anthropic API service_tier accepts: "auto" | "standard_only" (request values).
+# Gemini API service_tier accepts: "priority" | "flex" (omit for default/standard).
+TIER_API_VALUE = {
+    "anthropic": {
+        "standard": "standard_only",   # never use priority capacity
+        "priority": "auto",            # prefer priority, fall back to standard
+    },
+    "gemini": {
+        "standard": None,              # omit (default)
+        "priority": "priority",
+        "flex":     "flex",
+    },
 }
 
 
@@ -52,16 +78,16 @@ TIERS_BY_PROVIDER = {
 
 SMART_ROUTING = {
     "anthropic": {
-        "sql": "claude-haiku-4-5",      # cheap, fast
-        "conversational": "claude-sonnet-4-20250514",
-        "analyze": "claude-sonnet-4-20250514",
-        "agent": "claude-sonnet-4-20250514",   # best agentic capability
+        "sql":            "claude-haiku-4-5",    # cheap, fast
+        "conversational": "claude-sonnet-4-6",
+        "analyze":        "claude-sonnet-4-6",
+        "agent":          "claude-sonnet-4-6",   # best agentic capability
     },
     "gemini": {
-        "sql": "gemini/gemini-2.5-flash-lite",
+        "sql":            "gemini/gemini-2.5-flash-lite",
         "conversational": "gemini/gemini-2.5-flash",
-        "analyze": "gemini/gemini-2.5-flash",
-        "agent": "gemini/gemini-2.5-pro",
+        "analyze":        "gemini/gemini-2.5-flash",
+        "agent":          "gemini/gemini-3.1-pro-preview",  # most capable
     },
 }
 
@@ -201,6 +227,12 @@ def llm_complete(
     # Convert our Anthropic-style tool schema to OpenAI format for LiteLLM
     openai_tools = _convert_tools_to_openai(tools) if tools else None
 
+    # Map our UI-facing tier (standard/priority/flex) to the actual wire value
+    # expected by each provider's API. Gemini uses "priority"/"flex" directly,
+    # Anthropic uses "auto"/"standard_only", and some tiers mean "omit the param".
+    provider = provider_of(model)
+    api_tier = TIER_API_VALUE.get(provider, {}).get(tier)
+
     # Build kwargs
     kwargs = {
         "model": model,
@@ -210,11 +242,28 @@ def llm_complete(
     }
     if openai_tools:
         kwargs["tools"] = openai_tools
-    if tier and tier != "standard":
-        kwargs["service_tier"] = tier
+    if api_tier is not None:
+        kwargs["service_tier"] = api_tier
 
     t0 = time.time()
-    response = litellm.completion(**kwargs)
+    try:
+        response = litellm.completion(**kwargs)
+    except Exception as e:
+        # Graceful fallback: some LiteLLM / provider combinations don't accept
+        # service_tier. Rather than surfacing a confusing error, drop the param
+        # and retry once.
+        err_str = str(e).lower()
+        if api_tier is not None and ("service_tier" in err_str or "unsupported" in err_str
+                                    or "unknown" in err_str or "unexpected" in err_str
+                                    or "bad request" in err_str):
+            logger.warning(
+                f"service_tier={api_tier!r} not supported by {provider} / LiteLLM — "
+                f"retrying without it. Original error: {e}"
+            )
+            kwargs.pop("service_tier", None)
+            response = litellm.completion(**kwargs)
+        else:
+            raise
     elapsed = time.time() - t0
 
     # Parse response

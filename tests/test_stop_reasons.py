@@ -207,7 +207,7 @@ class TestSmartRoutingDefault:
     def test_explicit_override_wins(self, app_module, session_state):
         """When user picks a specific model, smart routing is bypassed."""
         session_state["provider"] = "anthropic"
-        session_state["model_label"] = "Claude Opus 4"
+        session_state["model_label"] = "Claude Opus 4.7"
         session_state["smart_routing"] = False  # override engaged
         # Every task returns the picked model, not task-specific
         for task in ["sql", "agent"]:

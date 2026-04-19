@@ -536,7 +536,7 @@ DATABASE SCHEMA:
 # Agent loop - tool use / skills
 # ---------------------------------------------------------------------------
 
-AGENT_MAX_STEPS = 10
+AGENT_MAX_STEPS = 20  # bumped from 10 — multi-category tasks need 12-15 steps
 AGENT_MAX_TOKENS = 8192
 
 
@@ -562,17 +562,24 @@ def run_agent_loop(question, schema_text, api_key, conn_kwargs, chat_history=Non
                 "You are an autonomous data analyst agent for a PostgreSQL database. "
                 "The user is non-technical. You have tools to query the database and "
                 "create downloadable Excel/Word files.\n\n"
-                "WORKFLOW:\n"
-                "1. Call `query_database` to gather the data you need (can call multiple times).\n"
-                "2. If the user asked for a file, call `create_excel_artifact` or `create_word_artifact` "
-                "   to build the actual file. Organize data into clear sheets or sections.\n"
-                "3. After creating any artifact, end your turn with a short message telling "
-                "   the user what you built and that they can download it below.\n\n"
+                "EFFICIENT WORKFLOW (IMPORTANT — you have a hard step budget):\n"
+                "1. **FIRST STEP**: Run ONE broad `query_database` call to gather ALL the "
+                "   schema/data you need for the entire task (e.g. SELECT table_name, "
+                "   column_name, data_type FROM information_schema... for all tables at once).\n"
+                "   Do NOT run separate queries per category — gather everything first.\n"
+                "2. Categorize / filter the results in your head, using the data already returned.\n"
+                "3. For each group or category, call `create_excel_artifact` or "
+                "   `create_word_artifact` DIRECTLY — do NOT re-query the database.\n"
+                "4. When done, end your turn with a short message listing the files created.\n\n"
+                "STEP BUDGET:\n"
+                "- You have at most 20 tool-call steps. ONE broad query + N artifact-builds "
+                "  is the efficient pattern. Do not waste steps on redundant queries.\n"
+                "- If a query result looks incomplete (hit the 500-row limit), THEN run "
+                "  a second, more targeted query — not otherwise.\n\n"
                 "RULES:\n"
                 "- Only read-only SELECT/WITH queries. The database is in read-only mode.\n"
                 "- If a query fails with an error, fix the SQL and retry — don't give up.\n"
                 "- Use table aliases when joining information_schema tables to avoid ambiguous columns.\n"
-                "- Be efficient — combine queries where possible rather than running one per row.\n"
                 "- Present final results in plain English. Don't dump raw SQL on the user.\n"
                 "- If the user asked for an Excel or Word file, you MUST create the artifact before ending.\n"
                 "- If the result would produce >200 rows across sheets/sections, SPLIT into multiple "
@@ -710,11 +717,21 @@ def run_agent_loop(question, schema_text, api_key, conn_kwargs, chat_history=Non
         return resp.text.strip() if resp.text else "", artifacts, None
 
     # Exhausted iterations
-    logger.warning(f"AGENT exhausted {AGENT_MAX_STEPS} steps")
-    return (
-        f"I reached my step limit ({AGENT_MAX_STEPS}) without finishing. "
-        "Please try breaking your request into smaller parts."
-    ), artifacts, None
+    logger.warning(f"AGENT exhausted {AGENT_MAX_STEPS} steps | artifacts built={len(artifacts)}")
+    if artifacts:
+        file_list = "\n".join(f"- **{a['title']}** (`{a['filename']}`)" for a in artifacts)
+        msg = (
+            f"I built **{len(artifacts)} file(s)** before reaching my step limit ({AGENT_MAX_STEPS}):\n\n"
+            f"{file_list}\n\n"
+            "You can download these below. To get the rest, ask me about the remaining "
+            "areas/categories — I'll pick up where I left off."
+        )
+    else:
+        msg = (
+            f"I reached my step limit ({AGENT_MAX_STEPS}) without finishing. "
+            "Please try breaking your request into smaller parts."
+        )
+    return msg, artifacts, None
 
 
 # ---------------------------------------------------------------------------
@@ -834,10 +851,10 @@ with st.sidebar:
         index=tier_options.index(st.session_state.tier),
         format_func=lambda t: t.capitalize(),
         help=(
-            "Standard: default rate. "
-            "Priority: faster/guaranteed SLA (higher cost). "
-            "Flex: 50% off, opportunistic (Gemini only). "
-            "Batch: 50% off, async (Gemini only)."
+            "Standard: default capacity (best price). "
+            "Priority: prefer priority capacity if available, fall back to standard "
+            "(higher cost when used). "
+            "Flex: 50% off, off-peak opportunistic capacity (Gemini only)."
         ),
     )
 

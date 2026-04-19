@@ -151,6 +151,48 @@ class TestAgentLoop:
         assert "step limit" in text.lower()
         assert mock_anthropic.messages.create.call_count == app_module.AGENT_MAX_STEPS
 
+    def test_max_steps_budget_is_20(self, app_module):
+        """Step budget was bumped from 10 to 20 for multi-category tasks."""
+        assert app_module.AGENT_MAX_STEPS == 20
+
+    def test_max_steps_reports_built_artifacts(self, app_module, mock_anthropic, mock_psycopg2):
+        """When steps are exhausted but artifacts were built, the message
+        should list them — not leave the user thinking nothing was created."""
+        cursor = mock_psycopg2.return_value.cursor.return_value
+        cursor.fetchmany.return_value = []
+        cursor.description = []
+
+        # Alternate: build artifact, then keep querying, never end
+        excel_call = _tool_use_response(
+            "create_excel_artifact",
+            {"filename": "partial.xlsx", "title": "Partial Report",
+             "summary": "Built before step limit", "sheets": {"S1": [{"x": 1}]}},
+            tool_call_id="t_excel",
+        )
+        query_call = _tool_use_response(
+            "query_database",
+            {"query": "SELECT 1", "purpose": "loop"},
+            tool_call_id="t_q",
+        )
+        # First call builds excel, rest are infinite queries
+        responses = [excel_call] + [query_call] * (app_module.AGENT_MAX_STEPS + 5)
+        mock_anthropic.messages.create.side_effect = responses
+
+        text, artifacts, err = app_module.run_agent_loop(
+            "build many reports", SAMPLE_SCHEMA_TEXT, "key",
+            conn_kwargs=_base_conn_kwargs(),
+        )
+
+        assert err is None
+        assert len(artifacts) == 1
+        assert artifacts[0]["filename"] == "partial.xlsx"
+        # Critical: the user-facing message should mention the file, not just "step limit"
+        assert "Partial Report" in text
+        assert "partial.xlsx" in text
+        assert "1 file" in text.lower() or "1 file(s)" in text
+        # Should suggest next action
+        assert "remaining" in text.lower() or "rest" in text.lower() or "ask" in text.lower()
+
     def test_api_error_returns(self, app_module, mock_anthropic):
         """API error propagates as err."""
         mock_anthropic.messages.create.side_effect = Exception("rate limit")

@@ -39,11 +39,18 @@ class TestSmartRouting:
 
 
 class TestProviderInference:
-    def test_anthropic_model(self):
+    def test_anthropic_model_current(self):
+        assert llm_client.provider_of("claude-sonnet-4-6") == "anthropic"
+        assert llm_client.provider_of("claude-opus-4-7") == "anthropic"
+        assert llm_client.provider_of("claude-haiku-4-5") == "anthropic"
+
+    def test_anthropic_model_legacy(self):
+        """Legacy dated IDs still classified as anthropic."""
         assert llm_client.provider_of("claude-sonnet-4-20250514") == "anthropic"
 
     def test_gemini_with_prefix(self):
         assert llm_client.provider_of("gemini/gemini-2.5-pro") == "gemini"
+        assert llm_client.provider_of("gemini/gemini-3.1-pro-preview") == "gemini"
 
     def test_gemini_bare_name(self):
         assert llm_client.provider_of("gemini-2.5-flash") == "gemini"
@@ -137,7 +144,8 @@ class TestLLMComplete:
         assert resp.tool_calls[0].name == "query_database"
         assert resp.tool_calls[0].input == {"query": "SELECT 1"}
 
-    def test_tier_passed_through(self, mock_litellm):
+    def test_gemini_priority_maps_to_priority(self, mock_litellm):
+        """Gemini 'priority' tier is passed verbatim."""
         mock_litellm.return_value = make_api_response("ok")
         llm_client.llm_complete(
             model="gemini/gemini-2.5-pro",
@@ -148,17 +156,80 @@ class TestLLMComplete:
         call_kwargs = mock_litellm.call_args.kwargs
         assert call_kwargs.get("service_tier") == "priority"
 
-    def test_standard_tier_not_sent(self, mock_litellm):
-        """Standard tier is the default — don't send it to save bandwidth."""
+    def test_gemini_flex_maps_to_flex(self, mock_litellm):
         mock_litellm.return_value = make_api_response("ok")
         llm_client.llm_complete(
-            model="claude-sonnet-4-20250514",
+            model="gemini/gemini-2.5-flash",
+            messages=[{"role": "user", "content": "x"}],
+            api_key="k",
+            tier="flex",
+        )
+        assert mock_litellm.call_args.kwargs.get("service_tier") == "flex"
+
+    def test_gemini_standard_tier_omits_param(self, mock_litellm):
+        """Gemini 'standard' = default = don't send the param."""
+        mock_litellm.return_value = make_api_response("ok")
+        llm_client.llm_complete(
+            model="gemini/gemini-2.5-pro",
             messages=[{"role": "user", "content": "x"}],
             api_key="k",
             tier="standard",
         )
-        call_kwargs = mock_litellm.call_args.kwargs
-        assert "service_tier" not in call_kwargs
+        assert "service_tier" not in mock_litellm.call_args.kwargs
+
+    def test_anthropic_standard_maps_to_standard_only(self, mock_litellm):
+        """Anthropic API requires 'standard_only' (not 'standard') to opt out of priority."""
+        mock_litellm.return_value = make_api_response("ok")
+        llm_client.llm_complete(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "x"}],
+            api_key="k",
+            tier="standard",
+        )
+        assert mock_litellm.call_args.kwargs.get("service_tier") == "standard_only"
+
+    def test_anthropic_priority_maps_to_auto(self, mock_litellm):
+        """Anthropic's 'priority' user intent maps to 'auto' — prefer priority, fall back."""
+        mock_litellm.return_value = make_api_response("ok")
+        llm_client.llm_complete(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "x"}],
+            api_key="k",
+            tier="priority",
+        )
+        assert mock_litellm.call_args.kwargs.get("service_tier") == "auto"
+
+    def test_service_tier_unsupported_graceful_fallback(self, mock_litellm):
+        """If LiteLLM rejects service_tier, we retry once without it."""
+        # First call raises "unknown parameter service_tier"
+        # Second call succeeds
+        mock_litellm.side_effect = [
+            Exception("litellm.BadRequestError: unexpected keyword argument 'service_tier'"),
+            make_api_response("fallback ok"),
+        ]
+        resp = llm_client.llm_complete(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "x"}],
+            api_key="k",
+            tier="priority",
+        )
+        assert resp.text == "fallback ok"
+        # Called twice: first with service_tier, second without
+        assert mock_litellm.call_count == 2
+        # Second call must NOT have service_tier
+        assert "service_tier" not in mock_litellm.call_args_list[1].kwargs
+
+    def test_non_tier_errors_still_raise(self, mock_litellm):
+        """Errors unrelated to service_tier must NOT trigger fallback."""
+        mock_litellm.side_effect = Exception("network error: connection refused")
+        with pytest.raises(Exception, match="network error"):
+            llm_client.llm_complete(
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "x"}],
+                api_key="k",
+                tier="priority",
+            )
+        assert mock_litellm.call_count == 1  # no retry
 
     def test_system_string_becomes_system_message(self, mock_litellm):
         mock_litellm.return_value = make_api_response("ok")
@@ -271,11 +342,46 @@ class TestMessageHelpers:
 
 class TestTierCatalog:
     def test_anthropic_tiers(self):
-        assert "standard" in llm_client.TIERS_BY_PROVIDER["anthropic"]
-        assert "priority" in llm_client.TIERS_BY_PROVIDER["anthropic"]
+        assert llm_client.TIERS_BY_PROVIDER["anthropic"] == ["standard", "priority"]
 
     def test_gemini_tiers(self):
         assert "standard" in llm_client.TIERS_BY_PROVIDER["gemini"]
         assert "priority" in llm_client.TIERS_BY_PROVIDER["gemini"]
         assert "flex" in llm_client.TIERS_BY_PROVIDER["gemini"]
-        assert "batch" in llm_client.TIERS_BY_PROVIDER["gemini"]
+
+    def test_batch_removed_from_live_tiers(self):
+        """Batch is a separate async API endpoint, not a per-request tier.
+        It must not appear in the live-query tier dropdown."""
+        assert "batch" not in llm_client.TIERS_BY_PROVIDER["gemini"]
+        assert "batch" not in llm_client.TIERS_BY_PROVIDER["anthropic"]
+
+
+class TestModelCatalogs:
+    def test_anthropic_has_current_models(self):
+        """Current generation Claude models are present."""
+        values = set(llm_client.ANTHROPIC_MODELS.values())
+        assert "claude-opus-4-7" in values
+        assert "claude-sonnet-4-6" in values
+        assert "claude-haiku-4-5" in values
+
+    def test_anthropic_deprecated_removed(self):
+        """Deprecated IDs (retire 2026-06-15) must not be offered."""
+        values = set(llm_client.ANTHROPIC_MODELS.values())
+        assert "claude-sonnet-4-20250514" not in values
+        assert "claude-opus-4-20250514" not in values
+
+    def test_anthropic_labels_match_ids(self):
+        """No mismatched labels (e.g. 'Haiku 3.5' pointing to '4-5')."""
+        for label, model_id in llm_client.ANTHROPIC_MODELS.items():
+            # Haiku 4.5 label should map to -haiku- id, not haiku-3
+            if "haiku" in label.lower():
+                assert "haiku" in model_id.lower()
+                # Label version should match model version
+                if "4.5" in label:
+                    assert "4-5" in model_id
+
+    def test_gemini_has_current_models(self):
+        values = set(llm_client.GEMINI_MODELS.values())
+        assert "gemini/gemini-3.1-pro-preview" in values
+        assert "gemini/gemini-2.5-pro" in values
+        assert "gemini/gemini-2.5-flash-lite" in values
