@@ -18,9 +18,9 @@ class TestSmartRouting:
         assert llm_client.smart_pick_model("gemini", "sql").startswith("gemini")
         assert llm_client.smart_pick_model("gemini", "agent").startswith("gemini")
 
-    def test_sql_picks_haiku_for_anthropic(self):
-        """Cheap/fast model for the routing call."""
-        assert "haiku" in llm_client.smart_pick_model("anthropic", "sql").lower()
+    def test_sql_picks_opus_for_anthropic(self):
+        """Anthropic routing call / planner uses Opus (quality over cost)."""
+        assert "opus" in llm_client.smart_pick_model("anthropic", "sql").lower()
 
     def test_sql_picks_flash_lite_for_gemini(self):
         assert "flash-lite" in llm_client.smart_pick_model("gemini", "sql").lower()
@@ -362,7 +362,6 @@ class TestModelCatalogs:
         values = set(llm_client.ANTHROPIC_MODELS.values())
         assert "claude-opus-4-7" in values
         assert "claude-sonnet-4-6" in values
-        assert "claude-haiku-4-5" in values
 
     def test_anthropic_deprecated_removed(self):
         """Deprecated IDs (retire 2026-06-15) must not be offered."""
@@ -370,15 +369,32 @@ class TestModelCatalogs:
         assert "claude-sonnet-4-20250514" not in values
         assert "claude-opus-4-20250514" not in values
 
+    def test_anthropic_haiku_excluded(self):
+        """Per project policy: Haiku is NOT offered — only Sonnet and Opus."""
+        values = set(llm_client.ANTHROPIC_MODELS.values())
+        assert "claude-haiku-4-5" not in values
+        for label in llm_client.ANTHROPIC_MODELS.keys():
+            assert "haiku" not in label.lower()
+
+    def test_anthropic_smart_routing_no_haiku(self):
+        """Smart routing for Anthropic never picks Haiku."""
+        for task in ("sql", "conversational", "analyze", "agent"):
+            picked = llm_client.smart_pick_model("anthropic", task)
+            assert "haiku" not in picked.lower(), f"task={task} picked={picked}"
+
+    def test_anthropic_planner_uses_opus(self):
+        """The 'sql' task (orchestrator routing + planner) uses Opus for Anthropic."""
+        assert "opus" in llm_client.smart_pick_model("anthropic", "sql").lower()
+
     def test_anthropic_labels_match_ids(self):
-        """No mismatched labels (e.g. 'Haiku 3.5' pointing to '4-5')."""
+        """No mismatched labels (e.g. '4.5' pointing to '4-6' id)."""
         for label, model_id in llm_client.ANTHROPIC_MODELS.items():
-            # Haiku 4.5 label should map to -haiku- id, not haiku-3
-            if "haiku" in label.lower():
-                assert "haiku" in model_id.lower()
-                # Label version should match model version
-                if "4.5" in label:
-                    assert "4-5" in model_id
+            # Extract version like "4.7" from label; check it appears as "4-7" in id
+            import re as _re
+            m = _re.search(r"(\d+)\.(\d+)", label)
+            if m:
+                label_ver = f"{m.group(1)}-{m.group(2)}"
+                assert label_ver in model_id, f"Label {label!r} and id {model_id!r} mismatch"
 
     def test_gemini_has_current_models(self):
         values = set(llm_client.GEMINI_MODELS.values())

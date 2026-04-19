@@ -77,8 +77,8 @@ class TestAskClaudeForSql:
         mock_anthropic.messages.create.return_value = make_api_response("SELECT 1")
         app_module.ask_claude_for_sql("test", SAMPLE_SCHEMA_TEXT, "key")
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
-        # Default model is now the smart-routing pick for "sql" task — Haiku
-        assert call_kwargs["model"] == "claude-haiku-4-5"
+        # Default model for "sql" task is Opus (Haiku is excluded from this project).
+        assert call_kwargs["model"] == "claude-opus-4-7"
         assert call_kwargs["max_tokens"] == 1024
 
     def test_chat_history_uses_summary(self, app_module, mock_anthropic):

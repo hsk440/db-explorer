@@ -30,9 +30,9 @@ logger = logging.getLogger("db_explorer")
 ANTHROPIC_MODELS = {
     # Current generation (April 2026) — verified against
     # https://platform.claude.com/docs/en/about-claude/models/overview
+    # NOTE: Haiku intentionally excluded per project policy — only Opus & Sonnet.
     "Claude Opus 4.7":   "claude-opus-4-7",              # current flagship
     "Claude Sonnet 4.6": "claude-sonnet-4-6",            # current best-value
-    "Claude Haiku 4.5":  "claude-haiku-4-5",             # current cheapest
     # Legacy (still available, not deprecated)
     "Claude Sonnet 4.5": "claude-sonnet-4-5-20250929",
     "Claude Opus 4.6":   "claude-opus-4-6",
@@ -77,8 +77,11 @@ TIER_API_VALUE = {
 # ---------------------------------------------------------------------------
 
 SMART_ROUTING = {
+    # Anthropic: Sonnet + Opus only (no Haiku per project policy).
+    # The "sql" task drives both the routing call and the multi-step planner —
+    # planning quality matters most, so we use Opus there despite the cost.
     "anthropic": {
-        "sql":            "claude-haiku-4-5",    # cheap, fast
+        "sql":            "claude-opus-4-7",     # routing + planner (quality > cost)
         "conversational": "claude-sonnet-4-6",
         "analyze":        "claude-sonnet-4-6",
         "agent":          "claude-sonnet-4-6",   # best agentic capability
@@ -90,6 +93,17 @@ SMART_ROUTING = {
         "agent":          "gemini/gemini-3.1-pro-preview",  # most capable
     },
 }
+
+
+# Set of (provider, model) pairs known to reject the service_tier param.
+# Populated on the first rejection; subsequent calls skip the param entirely
+# to avoid re-triggering the warning log on every call.
+_TIER_UNSUPPORTED: set[tuple[str, str]] = set()
+
+
+def reset_tier_cache() -> None:
+    """Clear the service_tier-unsupported cache. Mainly for tests."""
+    _TIER_UNSUPPORTED.clear()
 
 
 def smart_pick_model(provider: str, task: str) -> str:
@@ -233,6 +247,11 @@ def llm_complete(
     provider = provider_of(model)
     api_tier = TIER_API_VALUE.get(provider, {}).get(tier)
 
+    # Skip service_tier entirely if we've already learned this provider/model
+    # pair rejects it (avoids repeating the warning log on every single call).
+    if api_tier is not None and (provider, model) in _TIER_UNSUPPORTED:
+        api_tier = None
+
     # Build kwargs
     kwargs = {
         "model": model,
@@ -250,15 +269,16 @@ def llm_complete(
         response = litellm.completion(**kwargs)
     except Exception as e:
         # Graceful fallback: some LiteLLM / provider combinations don't accept
-        # service_tier. Rather than surfacing a confusing error, drop the param
-        # and retry once.
+        # service_tier. Rather than surfacing a confusing error, drop the param,
+        # remember it, and retry once.
         err_str = str(e).lower()
         if api_tier is not None and ("service_tier" in err_str or "unsupported" in err_str
                                     or "unknown" in err_str or "unexpected" in err_str
                                     or "bad request" in err_str):
+            _TIER_UNSUPPORTED.add((provider, model))
             logger.warning(
-                f"service_tier={api_tier!r} not supported by {provider} / LiteLLM — "
-                f"retrying without it. Original error: {e}"
+                f"service_tier not supported by {provider}/{model} — caching and "
+                f"dropping for future calls. Original error: {e}"
             )
             kwargs.pop("service_tier", None)
             response = litellm.completion(**kwargs)

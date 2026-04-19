@@ -735,6 +735,228 @@ def run_agent_loop(question, schema_text, api_key, conn_kwargs, chat_history=Non
 
 
 # ---------------------------------------------------------------------------
+# Plan → Execute → Synthesize orchestrator
+# ---------------------------------------------------------------------------
+
+PLANNER_MAX_SUBTASKS = 10
+
+
+def plan_question(question, schema_text, api_key, model=None, tier="standard"):
+    """Decompose the user's question into independent subtasks.
+
+    Returns a list of subtask dicts:
+        [{"id": 1, "title": "...", "scope": "..."}]
+
+    - Empty list means "no decomposition needed — run as a single agent task."
+    - Max 10 subtasks. The planner is instructed to be conservative: only
+      split if the result would produce multiple artifacts.
+
+    Uses a cheap/fast model (Haiku / Flash-Lite) since this is structured output.
+    """
+    if model is None:
+        model = llm_client.smart_pick_model("anthropic", "sql")
+
+    system_prompt = f"""You are a task planner for a database assistant app.
+Given a user question about a PostgreSQL database, decide whether the task
+should be split into multiple independent sub-tasks.
+
+WHEN TO SPLIT:
+- The question asks for multiple separate artifacts ("one Excel per category",
+  "for each area", "split by region", "per department").
+- The question covers multiple distinct areas each needing its own file.
+- The scope is large enough that a single artifact would be huge (>200 rows).
+
+WHEN NOT TO SPLIT:
+- A single query or single-file answer.
+- A conversational question.
+- A focused request about one table/area.
+
+OUTPUT FORMAT:
+Return ONLY valid JSON (no markdown fences, no commentary):
+{{
+  "subtasks": [
+    {{"id": 1, "title": "Short area/category name", "scope": "Concrete filter for this subtask"}},
+    ...
+  ]
+}}
+
+If no split is needed, return {{"subtasks": []}}.
+Max {PLANNER_MAX_SUBTASKS} subtasks.
+
+DATABASE SCHEMA (for reference; use it to decide sensible categorizations):
+{schema_text}"""
+
+    messages = [{"role": "user", "content": question}]
+    logger.info(f"PLANNER REQUEST | model={model} | question: {question[:150]}")
+    try:
+        resp = llm_client.llm_complete(
+            model=model, messages=messages, api_key=api_key,
+            system=system_prompt, max_tokens=2048, tier=tier,
+        )
+    except Exception as e:
+        logger.error(f"PLANNER FAILED | {e} — falling back to no-split")
+        return []
+
+    text = (resp.text or "").strip()
+    # Strip markdown fences if present
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text)
+    text = text.strip()
+
+    try:
+        plan = json.loads(text)
+        subtasks = plan.get("subtasks", [])
+        if not isinstance(subtasks, list):
+            raise ValueError("subtasks is not a list")
+        # Cap and validate shape
+        clean = []
+        for i, st_item in enumerate(subtasks[:PLANNER_MAX_SUBTASKS]):
+            if not isinstance(st_item, dict):
+                continue
+            clean.append({
+                "id": st_item.get("id", i + 1),
+                "title": str(st_item.get("title", f"Part {i + 1}")),
+                "scope": str(st_item.get("scope", "")),
+            })
+        logger.info(f"PLANNER OK | {len(clean)} subtask(s) | tokens in={resp.input_tokens} out={resp.output_tokens}")
+        return clean
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"PLANNER returned non-JSON ({e}) — falling back to no-split. Text: {text[:200]}")
+        return []
+
+
+def synthesize_response(question, artifacts, api_key, model=None, tier="standard"):
+    """Produce a short friendly user-facing response listing the artifacts built.
+
+    Uses a cheap/fast model since this is just a summarization task.
+    """
+    if model is None:
+        model = llm_client.smart_pick_model("anthropic", "conversational")
+
+    if not artifacts:
+        return "I wasn't able to build any artifacts for this request. Try rephrasing?"
+
+    artifact_lines = "\n".join(
+        f"- **{a['title']}** ({a['filename']}, {skills.format_size(a['size_bytes'])}): {a.get('summary', '')}"
+        for a in artifacts
+    )
+
+    user_content = f"""The user asked: {question}
+
+I built {len(artifacts)} file(s) for them:
+{artifact_lines}
+
+Write a short, friendly 2-3 sentence response telling them what was created and
+inviting them to download below. Do NOT repeat the full list of filenames —
+summarize the count and key areas. Use bullet points or bold sparingly."""
+
+    logger.info(f"SYNTHESIZER REQUEST | {len(artifacts)} artifacts | model={model}")
+    try:
+        resp = llm_client.llm_complete(
+            model=model, messages=[{"role": "user", "content": user_content}],
+            api_key=api_key, max_tokens=1024, tier=tier,
+        )
+        return (resp.text or "").strip() or f"I built {len(artifacts)} file(s). Download them below."
+    except Exception as e:
+        logger.warning(f"SYNTHESIZER FAILED | {e} — falling back to default message")
+        return f"I built {len(artifacts)} file(s). Download them below."
+
+
+def run_plan_execute_synthesize(
+    question, schema_text, api_key, conn_kwargs,
+    chat_history=None, progress_cb=None, artifact_cb=None,
+    model_overrides=None, tier="standard",
+):
+    """High-level orchestrator: Plan → Execute-per-subtask → Synthesize.
+
+    Args:
+        progress_cb: callable(message: str, current: int = None, total: int = None)
+            called with progress updates. current/total for progress bar.
+        artifact_cb: callable(artifact: dict)
+            called each time a new artifact is produced.
+        model_overrides: dict with keys 'sql', 'conversational', 'agent' for
+            per-task model selection. None means use smart routing.
+
+    Returns: (final_text, artifacts, error)
+    """
+    if model_overrides is None:
+        model_overrides = {}
+
+    def _pick(task):
+        return model_overrides.get(task) or llm_client.smart_pick_model("anthropic", task)
+
+    # Phase 1: PLAN
+    if progress_cb:
+        progress_cb("Planning...", current=0, total=None)
+    subtasks = plan_question(
+        question, schema_text, api_key,
+        model=_pick("sql"), tier=tier,
+    )
+
+    # No decomposition needed — fall through to the existing single-agent path
+    if not subtasks:
+        logger.info("PLANNER decided no-split — using single agent loop")
+        if progress_cb:
+            progress_cb("Running agent...", current=None, total=None)
+        return run_agent_loop(
+            question, schema_text, api_key, conn_kwargs,
+            chat_history=chat_history, progress_cb=progress_cb,
+            model=_pick("agent"), tier=tier,
+        )
+
+    # Phase 2: EXECUTE each subtask
+    logger.info(f"ORCHESTRATOR executing {len(subtasks)} subtasks")
+    all_artifacts = []
+    failures = []
+    total = len(subtasks)
+
+    for i, subtask in enumerate(subtasks, start=1):
+        title = subtask["title"]
+        scope = subtask["scope"]
+        if progress_cb:
+            progress_cb(f"Building {i}/{total}: {title}", current=i, total=total)
+
+        subtask_question = (
+            f"Task: {title}\n"
+            f"Scope: {scope}\n"
+            f"Context: The user originally asked: \"{question}\"\n"
+            f"Produce ONE artifact covering ONLY this scope. Keep it focused — "
+            f"don't include data from other areas."
+        )
+        _text, artifacts, err = run_agent_loop(
+            subtask_question, schema_text, api_key, conn_kwargs,
+            chat_history=None,  # fresh context per subtask
+            progress_cb=None,   # inner steps not surfaced at the subtask level
+            model=_pick("agent"), tier=tier,
+        )
+        if err:
+            logger.warning(f"SUBTASK {i} FAILED: {err}")
+            failures.append((title, err))
+            continue
+        for art in artifacts:
+            all_artifacts.append(art)
+            if artifact_cb:
+                artifact_cb(art)
+
+    # Phase 3: SYNTHESIZE
+    if progress_cb:
+        progress_cb("Summarizing...", current=total, total=total)
+    final_text = synthesize_response(
+        question, all_artifacts, api_key,
+        model=_pick("conversational"), tier=tier,
+    )
+
+    if failures:
+        fail_list = "\n".join(f"- {t}: {e}" for t, e in failures)
+        final_text += f"\n\n_Note: {len(failures)} subtask(s) failed:_\n{fail_list}"
+
+    logger.info(
+        f"ORCHESTRATOR DONE | {total} subtasks | {len(all_artifacts)} artifacts | {len(failures)} failures"
+    )
+    return final_text, all_artifacts, None
+
+
+# ---------------------------------------------------------------------------
 # Session state defaults
 # ---------------------------------------------------------------------------
 for key, default in {
@@ -1129,24 +1351,57 @@ with tab_nl:
                 st.session_state.chat_history.append({"role": "assistant", "content": response})
 
             elif sql and sql.strip().startswith("USE_AGENT_MODE"):
-                # Multi-step agent with tools (Excel/Word artifacts, multi-query)
+                # Plan → Execute → Synthesize orchestrator
+                # Shows a progress bar + live artifact cards as work proceeds.
                 status_placeholder = st.empty()
+                progress_placeholder = st.empty()
+                live_artifacts_container = st.container()
+                live_artifact_ids = []  # track to avoid duplicates if re-rendered
 
-                def update_status(msg):
-                    status_placeholder.info(f"🤖 {msg}")
+                def update_status(msg, current=None, total=None):
+                    with status_placeholder.container():
+                        st.info(f"🤖 {msg}")
+                    if total and total > 0:
+                        pct = (current or 0) / total
+                        progress_placeholder.progress(min(pct, 1.0), text=msg)
+                    else:
+                        progress_placeholder.empty()
 
-                update_status("Starting agent...")
-                response, new_artifacts, agent_err = run_agent_loop(
+                def on_artifact(art):
+                    # Render a live card as soon as each artifact is ready
+                    if art["id"] in live_artifact_ids:
+                        return
+                    live_artifact_ids.append(art["id"])
+                    with live_artifacts_container:
+                        icon = "📊" if art["type"] == "excel" else "📄"
+                        with st.container(border=True):
+                            st.markdown(f"**{icon} {art['title']}**")
+                            if art.get("summary"):
+                                st.caption(art["summary"])
+                            st.caption(
+                                f"{art['filename']} · {skills.format_size(art['size_bytes'])}"
+                            )
+
+                update_status("Starting...")
+                model_overrides = {
+                    "sql": pick_model("sql"),
+                    "conversational": pick_model("conversational"),
+                    "agent": pick_model("agent"),
+                }
+                response, new_artifacts, agent_err = run_plan_execute_synthesize(
                     question, schema_text, current_api_key(),
                     conn_kwargs=conn_params(),
                     chat_history=st.session_state.chat_history[:-1],
                     progress_cb=update_status,
-                    model=pick_model("agent"), tier=st.session_state.tier,
+                    artifact_cb=on_artifact,
+                    model_overrides=model_overrides,
+                    tier=st.session_state.tier,
                 )
                 status_placeholder.empty()
+                progress_placeholder.empty()
 
                 if agent_err:
-                    response = f"Sorry, the agent ran into an error: {agent_err}"
+                    response = f"Sorry, the orchestrator ran into an error: {agent_err}"
 
                 # Store artifacts in session state, keyed by id
                 artifact_ids = []
@@ -1155,16 +1410,6 @@ with tab_nl:
                     artifact_ids.append(art["id"])
 
                 st.markdown(response)
-                # Show artifacts inline immediately (before rerun)
-                for art in new_artifacts:
-                    icon = "📊" if art["type"] == "excel" else "📄"
-                    with st.container(border=True):
-                        st.markdown(f"**{icon} {art['title']}**")
-                        if art.get("summary"):
-                            st.caption(art["summary"])
-                        st.caption(
-                            f"{art['filename']} · {skills.format_size(art['size_bytes'])}"
-                        )
 
                 st.session_state.chat_history.append({
                     "role": "assistant",
